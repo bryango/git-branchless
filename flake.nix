@@ -27,8 +27,8 @@
             { meta, ... }:
             {
               name = "git-branchless";
-              version = "0.11.1";
               src = self;
+              version = with builtins; (fromTOML (readFile ./git-branchless/Cargo.toml)).package.version;
               cargoDeps = final.rustPlatform.importCargoLock {
                 lockFile = ./Cargo.lock;
               };
@@ -79,14 +79,24 @@
         {
           default = pkgs.mkShell {
             name = "git-branchless";
-            packages = [
-              pkgs.nixfmt
-              pkgs.cargo
-              pkgs.cargo-insta
-              pkgs.rustc
-              pkgs.rustfmt
-              pkgs.rust-analyzer
+            packages = with pkgs; [
+              nixfmt
+              cargo
+              cargo-insta
+              rustc
+              rustfmt
+              rust-analyzer
+              clippy
+              git
             ];
+
+            env = with pkgs; {
+              # for developments, e.g. symbol lookup in std library
+              RUST_SRC_PATH = "${rustPlatform.rustLibSrc}";
+              # for testing
+              TEST_GIT = "${git}/bin/git";
+              TEST_GIT_EXEC_PATH = "${git}/libexec/git-core";
+            };
           };
         }
       );
