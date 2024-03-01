@@ -11,7 +11,11 @@
         "x86_64-darwin"
         "x86_64-linux"
       ];
-      foreachSystem = lib.genAttrs systems;
+      foreachSystem = f: lib.genAttrs systems (system: f {
+        pkgs = nixpkgs.legacyPackages.${system};
+        /** final packages set (of a given system) provided in this flake */
+        final = self.packages.${system};
+      });
     in
     {
       overlays.default = (final: prev: {
@@ -55,20 +59,27 @@
         });
       });
 
-      packages = foreachSystem (system:
+      packages = foreachSystem ({ pkgs, ... }:
         let
-          pkgs = nixpkgs.legacyPackages.${system}.extend self.overlays.default;
+          final = pkgs.extend self.overlays.default;
         in
         {
-          inherit (pkgs)
+          inherit (final)
             git-branchless scm-diff-editor;
-          default = pkgs.git-branchless;
+          default = final.git-branchless;
         }
       );
 
-      checks = foreachSystem (system: {
+      devShells = foreachSystem ({ pkgs, final }: {
+        default = final.git-branchless.overrideAttrs (prev: {
+          # for developments, e.g. symbol lookup in std library
+          env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+        });
+      });
+
+      checks = foreachSystem ({ pkgs, final }: {
         git-branchless =
-          self.packages.${system}.git-branchless.overrideAttrs ({ preCheck, ... }: {
+          final.git-branchless.overrideAttrs ({ preCheck, ... }: {
             cargoBuildType = "debug";
             cargoCheckType = "debug";
             preCheck = ''
