@@ -363,7 +363,7 @@ fn test_init_uninstall() -> eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "man-pages")]
+#[cfg(feature = "separate-binaries")]
 #[test]
 fn test_man_viewer_installed() -> eyre::Result<()> {
     use std::collections::HashMap;
