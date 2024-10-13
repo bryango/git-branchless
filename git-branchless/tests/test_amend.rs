@@ -592,6 +592,14 @@ fn test_amend_undo() -> eyre::Result<()> {
     {
         let (stdout, _stderr) = git.branchless("undo", &["-y"])?;
         let stdout = trim_lines(stdout);
+        insta::with_settings!({filters => vec![
+            // ignore difference numbering of events
+            ("Applied ([0-9]+) inverse events.", "Applied # inverse events."),
+            (r"(?m)^[0-9]+\. ", "#. "),
+            // ignore no-op checkouts
+            (r"\n.*Check out from (\S)\sto (\S)\n", r"\nNo-op check out: \1\2\n"),
+            (r"\nNo-op check out: ([0-9a-z]+){2}\n", "\n"),
+        ]}, {
         insta::assert_snapshot!(stdout, @r###"
         Will apply these actions:
         1. Move branch foo from 94b1077 create file1.txt
@@ -622,6 +630,7 @@ fn test_amend_undo() -> eyre::Result<()> {
         @ c0bdfb5 (> foo) create file1.txt
         Applied 6 inverse events.
         "###);
+        });
     }
 
     {
