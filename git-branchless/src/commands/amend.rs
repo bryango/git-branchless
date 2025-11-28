@@ -203,6 +203,7 @@ pub fn amend(
             Some(target),
             &CheckOutCommitOptions {
                 additional_args: Default::default(),
+                force_detach: false,
                 reset: true,
                 render_smartlog: false,
             },
@@ -293,10 +294,12 @@ pub fn amend(
             event_tx_id,
             force_in_memory: move_options.force_in_memory,
             force_on_disk: move_options.force_on_disk,
+            dry_run: false,
             preserve_timestamps: get_restack_preserve_timestamps(&repo)?,
             resolve_merge_conflicts: move_options.resolve_merge_conflicts,
             check_out_commit_options: CheckOutCommitOptions {
                 additional_args: Default::default(),
+                force_detach: false,
                 reset: false,
                 render_smartlog: false,
             },
@@ -311,7 +314,8 @@ pub fn amend(
         )? {
             ExecuteRebasePlanResult::Succeeded {
                 rewritten_oids: None,
-            } => {}
+            }
+            | ExecuteRebasePlanResult::WouldSucceed => {}
 
             ExecuteRebasePlanResult::Succeeded {
                 rewritten_oids: Some(rewritten_oids),

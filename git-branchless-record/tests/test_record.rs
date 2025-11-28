@@ -343,6 +343,89 @@ fn test_record_stash() -> eyre::Result<()> {
 }
 
 #[test]
+fn test_record_stash_detached_head() -> eyre::Result<()> {
+    let git = make_git()?;
+
+    if !git.supports_reference_transactions()? {
+        return Ok(());
+    }
+    git.init_repo()?;
+
+    git.detach_head()?;
+
+    {
+        git.commit_file("test1", 1)?;
+
+        let stdout = git.smartlog()?;
+        insta::assert_snapshot!(stdout, @r###"
+        O f777ecc (master) create initial.txt
+        |
+        @ 62fc20d create test1.txt
+        "###);
+    }
+
+    {
+        git.write_file_txt("test1", "new test1 contents\n")?;
+
+        let (stdout, _stderr) = git.branchless("record", &["-m", "foo", "--stash"])?;
+        insta::assert_snapshot!(stdout, @r###"
+        [detached HEAD 9b6164c] foo
+         1 file changed, 1 insertion(+), 1 deletion(-)
+        branchless: running command: <git-executable> checkout 62fc20d2a290daea0d52bdc2ed2ad4be6491010e
+        "###);
+    }
+
+    {
+        let stdout = git.smartlog()?;
+        insta::assert_snapshot!(stdout, @r###"
+        O f777ecc (master) create initial.txt
+        |
+        @ 62fc20d create test1.txt
+        |
+        o 9b6164c foo
+        "###);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_record_stash_default_message() -> eyre::Result<()> {
+    let git = make_git()?;
+
+    if !git.supports_reference_transactions()? {
+        return Ok(());
+    }
+    git.init_repo()?;
+
+    git.commit_file("test1", 1)?;
+
+    {
+        git.write_file_txt("test1", "new test1 contents\n")?;
+
+        let (stdout, _stderr) = git.branchless("record", &["--stash"])?;
+        insta::assert_snapshot!(stdout, @r###"
+        [master fd2ffa4] stash: test1.txt (+1/-1)
+         1 file changed, 1 insertion(+), 1 deletion(-)
+        branchless: running command: <git-executable> branch -f master 62fc20d2a290daea0d52bdc2ed2ad4be6491010e
+        branchless: running command: <git-executable> checkout master
+        "###);
+    }
+
+    {
+        let stdout = git.smartlog()?;
+        insta::assert_snapshot!(stdout, @r###"
+        :
+        @ 62fc20d (> master) create test1.txt
+        |
+        o fd2ffa4 stash: test1.txt (+1/-1)
+        "###);
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_record_create_branch() -> eyre::Result<()> {
     let git = make_git()?;
     git.init_repo()?;

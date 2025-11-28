@@ -11,7 +11,7 @@
     clippy::clone_on_ref_ptr,
     clippy::dbg_macro
 )]
-#![allow(clippy::too_many_arguments, clippy::blocks_in_if_conditions)]
+#![allow(clippy::too_many_arguments, clippy::blocks_in_conditions)]
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -117,12 +117,12 @@ fn install_tracing(effects: Effects) -> eyre::Result<impl Drop> {
 
 #[instrument]
 fn install_libgit2_tracing() {
-    fn git_trace(level: git2::TraceLevel, msg: &str) {
-        info!("[{:?}]: {}", level, msg);
+    fn git_trace(level: git2::TraceLevel, msg: &[u8]) {
+        info!("[{:?}]: {}", level, String::from_utf8_lossy(msg));
     }
 
-    if !git2::trace_set(git2::TraceLevel::Trace, git_trace) {
-        warn!("Failed to install libgit2 tracing");
+    if let Err(err) = git2::trace_set(git2::TraceLevel::Trace, git_trace) {
+        warn!("Failed to install libgit2 tracing: {err}");
     }
 }
 

@@ -7,7 +7,7 @@
     clippy::clone_on_ref_ptr,
     clippy::dbg_macro
 )]
-#![allow(clippy::too_many_arguments, clippy::blocks_in_if_conditions)]
+#![allow(clippy::too_many_arguments, clippy::blocks_in_conditions)]
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -31,9 +31,9 @@ use lib::core::rewrite::{
     RepoResource,
 };
 use lib::git::{
-    process_diff_for_record, update_index, CategorizedReferenceName, FileMode, GitRunInfo,
-    MaybeZeroOid, NonZeroOid, Repo, ResolvedReferenceInfo, Stage, UpdateIndexCommand,
-    WorkingCopyChangesType, WorkingCopySnapshot,
+    process_diff_for_record, summarize_diff_for_temporary_commit, update_index,
+    CategorizedReferenceName, FileMode, GitRunInfo, MaybeZeroOid, NonZeroOid, Repo,
+    ResolvedReferenceInfo, Stage, UpdateIndexCommand, WorkingCopyChangesType, WorkingCopySnapshot,
 };
 use lib::try_exit_code;
 use lib::util::{ExitCode, EyreExitOr};
@@ -129,6 +129,7 @@ fn record(
             None,
             &CheckOutCommitOptions {
                 additional_args: vec![OsString::from("-b"), OsString::from(branch_name)],
+                force_detach: false,
                 reset: false,
                 render_smartlog: false,
             },
@@ -157,6 +158,12 @@ fn record(
             )?);
         }
     } else {
+        let messages = if messages.is_empty() && stash {
+            get_default_stash_message(&repo, effects, &snapshot, &working_copy_changes_type)
+                .map(|message| vec![message])?
+        } else {
+            messages
+        };
         let args = {
             let mut args = vec!["commit"];
             args.extend(messages.iter().flat_map(|message| ["--message", message]));
@@ -170,53 +177,76 @@ fn record(
 
     if detach || stash {
         let head_info = repo.get_head_info()?;
-        if let ResolvedReferenceInfo {
-            oid: Some(oid),
-            reference_name: Some(reference_name),
-        } = &head_info
-        {
-            let head_commit = repo.find_commit_or_fail(*oid)?;
-            match head_commit.get_parents().as_slice() {
-                [] => try_exit_code!(git_run_info.run(
-                    effects,
-                    Some(event_tx_id),
-                    &[
-                        "update-ref",
-                        "-d",
-                        reference_name.as_str(),
-                        &oid.to_string(),
-                    ],
-                )?),
-                [parent_commit] => {
-                    let branch_name = CategorizedReferenceName::new(reference_name).render_suffix();
-                    repo.detach_head(&head_info)?;
-                    try_exit_code!(git_run_info.run(
+        let checkout_target = match &head_info {
+            ResolvedReferenceInfo {
+                oid: None,
+                reference_name: Some(reference_name),
+            } => {
+                // FIXME: unborn HEAD, what to do?
+                Some(CheckoutTarget::Reference(reference_name.clone()))
+            }
+
+            ResolvedReferenceInfo {
+                oid: Some(oid),
+                reference_name: Some(reference_name),
+            } => {
+                let head_commit = repo.find_commit_or_fail(*oid)?;
+                match head_commit.get_parents().as_slice() {
+                    [] => try_exit_code!(git_run_info.run(
                         effects,
                         Some(event_tx_id),
                         &[
-                            "branch",
-                            "-f",
-                            &branch_name,
-                            &parent_commit.get_oid().to_string(),
+                            "update-ref",
+                            "-d",
+                            reference_name.as_str(),
+                            &oid.to_string(),
                         ],
-                    )?);
+                    )?),
+                    [parent_commit] => {
+                        let branch_name =
+                            CategorizedReferenceName::new(reference_name).render_suffix();
+                        repo.detach_head(&head_info)?;
+                        try_exit_code!(git_run_info.run(
+                            effects,
+                            Some(event_tx_id),
+                            &[
+                                "branch",
+                                "-f",
+                                &branch_name,
+                                &parent_commit.get_oid().to_string(),
+                            ],
+                        )?);
+                    }
+                    parent_commits => {
+                        eyre::bail!("git-branchless record --detach called on a merge commit, but it should only be capable of creating zero- or one-parent commits. Parents: {parent_commits:?}");
+                    }
                 }
-                parent_commits => {
-                    eyre::bail!("git-branchless record --detach called on a merge commit, but it should only be capable of creating zero- or one-parent commits. Parents: {parent_commits:?}");
-                }
+
+                Some(CheckoutTarget::Reference(reference_name.clone()))
             }
-        }
-        let checkout_target = match head_info {
-            ResolvedReferenceInfo {
-                oid: _,
-                reference_name: Some(reference_name),
-            } => Some(CheckoutTarget::Reference(reference_name.clone())),
+
             ResolvedReferenceInfo {
                 oid: Some(oid),
-                reference_name: _,
-            } => Some(CheckoutTarget::Oid(oid)),
-            _ => None,
+                reference_name: None,
+            } => {
+                let head_commit = repo.find_commit_or_fail(*oid)?;
+                match head_commit.get_parents().as_slice() {
+                    [] => {
+                        eyre::bail!("git-branchless record --stash seems to have created a root commit (commit without parents), but this should be impossible.");
+                    }
+                    [parent_commit] => Some(CheckoutTarget::Oid(parent_commit.get_oid())),
+                    parent_commits => {
+                        eyre::bail!("git-branchless record --stash seems to have created a merge commit, but this should be impossible. Parents: {parent_commits:?}");
+                    }
+                }
+            }
+
+            ResolvedReferenceInfo {
+                oid: None,
+                reference_name: None,
+            } => None,
         };
+
         if stash && checkout_target.is_some() {
             try_exit_code!(check_out_commit(
                 effects,
@@ -227,6 +257,7 @@ fn record(
                 checkout_target,
                 &CheckOutCommitOptions {
                     additional_args: vec![],
+                    force_detach: false,
                     reset: false,
                     render_smartlog: false,
                 },
@@ -546,6 +577,7 @@ To proceed anyways, run: git move -f -s 'siblings(.)",
         preserve_timestamps: get_restack_preserve_timestamps(&repo)?,
         force_in_memory: true,
         force_on_disk: false,
+        dry_run: false,
         resolve_merge_conflicts: false,
         check_out_commit_options: Default::default(),
     };
@@ -558,11 +590,51 @@ To proceed anyways, run: git move -f -s 'siblings(.)",
         &execute_options,
     )?;
     match result {
-        ExecuteRebasePlanResult::Succeeded { rewritten_oids: _ } => Ok(Ok(())),
+        ExecuteRebasePlanResult::Succeeded { rewritten_oids: _ }
+        | ExecuteRebasePlanResult::WouldSucceed => Ok(Ok(())),
         ExecuteRebasePlanResult::DeclinedToMerge { failed_merge_info } => {
             failed_merge_info.describe(effects, &repo, MergeConflictRemediation::Insert)?;
             Ok(Ok(()))
         }
         ExecuteRebasePlanResult::Failed { exit_code } => Ok(Err(exit_code)),
     }
+}
+
+#[instrument]
+fn get_default_stash_message(
+    repo: &Repo,
+    effects: &Effects,
+    snapshot: &WorkingCopySnapshot,
+    working_copy_changes_type: &WorkingCopyChangesType,
+) -> eyre::Result<String> {
+    let (old_tree, new_tree) = match working_copy_changes_type {
+        WorkingCopyChangesType::Unstaged => {
+            let old_tree = snapshot.commit_stage0.get_tree()?;
+            let new_tree = snapshot.commit_unstaged.get_tree()?;
+            (Some(old_tree), new_tree)
+        }
+        WorkingCopyChangesType::Staged => {
+            let old_tree = match snapshot.head_commit {
+                None => None,
+                Some(ref commit) => Some(commit.get_tree()?),
+            };
+            let new_tree = snapshot.commit_stage0.get_tree()?;
+            (old_tree, new_tree)
+        }
+        WorkingCopyChangesType::None | WorkingCopyChangesType::Conflicts => {
+            unreachable!("already handled via early exit")
+        }
+    };
+
+    let diff = repo.get_diff_between_trees(
+        effects,
+        old_tree.as_ref(),
+        &new_tree,
+        0, // we don't care about the context here
+    )?;
+
+    Ok(format!(
+        "stash: {}",
+        summarize_diff_for_temporary_commit(&diff)?
+    ))
 }

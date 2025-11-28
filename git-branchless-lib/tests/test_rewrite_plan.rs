@@ -759,9 +759,11 @@ fn create_and_execute_plan(
         preserve_timestamps: false,
         force_in_memory: false,
         force_on_disk: false,
+        dry_run: false,
         resolve_merge_conflicts: true,
         check_out_commit_options: CheckOutCommitOptions {
             additional_args: Default::default(),
+            force_detach: false,
             reset: false,
             render_smartlog: false,
         },

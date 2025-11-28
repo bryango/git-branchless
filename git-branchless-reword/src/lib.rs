@@ -7,7 +7,7 @@
     clippy::clone_on_ref_ptr,
     clippy::dbg_macro
 )]
-#![allow(clippy::too_many_arguments, clippy::blocks_in_if_conditions)]
+#![allow(clippy::too_many_arguments, clippy::blocks_in_conditions)]
 
 pub mod dialoguer_edit;
 
@@ -289,9 +289,11 @@ pub fn reword(
         preserve_timestamps: get_restack_preserve_timestamps(&repo)?,
         force_in_memory: true,
         force_on_disk: false,
+        dry_run: false,
         resolve_merge_conflicts: false,
         check_out_commit_options: CheckOutCommitOptions {
             additional_args: Default::default(),
+            force_detach: false,
             reset: false,
             render_smartlog: false,
         },
@@ -314,7 +316,8 @@ pub fn reword(
         }
         ExecuteRebasePlanResult::Succeeded {
             rewritten_oids: None,
-        } => Ok(Ok(())),
+        }
+        | ExecuteRebasePlanResult::WouldSucceed => Ok(Ok(())),
         ExecuteRebasePlanResult::DeclinedToMerge {
             failed_merge_info: _,
         } => {
