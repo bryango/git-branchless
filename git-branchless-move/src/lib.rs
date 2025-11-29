@@ -63,6 +63,11 @@ fn resolve_base_commit(
 
 /// Move a subtree from one place to another.
 #[instrument]
+/// Move commits or ranges in the commit graph to a new destination.
+/// This function orchestrates the logic for moving, inserting, or fixing up commits,
+/// handling various modes and options, and performing safety checks and planning.
+/// It interacts with the DAG, resolves revsets, builds and executes a rebase plan,
+/// and manages user feedback and error handling.
 pub fn r#move(
     effects: &Effects,
     git_run_info: &GitRunInfo,
@@ -76,15 +81,21 @@ pub fn r#move(
     insert: bool,
     dry_run: bool,
 ) -> EyreExitOr<()> {
+    // Flags to track which arguments were provided by the user.
     let sources_provided = !sources.is_empty();
     let bases_provided = !bases.is_empty();
     let exacts_provided = !exacts.is_empty();
     let dest_provided = dest.is_some();
+    // If no sources, bases, or exacts are provided, default sources to HEAD.
     let should_sources_default_to_head = !sources_provided && !bases_provided && !exacts_provided;
 
+    // Open the repository from the current directory.
     let repo = Repo::from_current_dir()?;
+    // Get the OID (object ID) of HEAD, if available.
     let head_oid = repo.get_head_info()?.oid;
 
+    // Determine the destination revset.
+    // If not provided, default to HEAD if possible, otherwise error.
     let dest = match dest {
         Some(dest) => dest,
         None => match head_oid {
@@ -96,6 +107,7 @@ pub fn r#move(
         },
     };
 
+    // Prepare repository state and DAG for planning.
     let references_snapshot = repo.get_references_snapshot()?;
     let conn = repo.get_db_conn()?;
     let event_log_db = EventLogDb::new(&conn)?;
@@ -109,6 +121,7 @@ pub fn r#move(
         &references_snapshot,
     )?;
 
+    // Resolve source, base, and exact commit sets from revsets.
     let source_oids: CommitSet =
         match resolve_commits(effects, &repo, &mut dag, &sources, resolve_revset_options) {
             Ok(commit_sets) => union_all(&commit_sets),
@@ -125,6 +138,7 @@ pub fn r#move(
                 return Ok(Err(ExitCode(1)));
             }
         };
+    // Resolve exact components, ensuring each has exactly one root and one parent.
     let exact_components = match resolve_commits(
         effects,
         &repo,
@@ -175,6 +189,7 @@ pub fn r#move(
         }
     };
 
+    // Resolve the destination OID, ensuring it refers to exactly one commit.
     let dest_oid: NonZeroOid = match resolve_commits(
         effects,
         &repo,
@@ -201,6 +216,7 @@ pub fn r#move(
         }
     };
 
+    // If no sources or bases provided, default base to HEAD.
     let base_oids = if should_sources_default_to_head {
         match head_oid {
             Some(head_oid) => CommitSet::from(head_oid),
@@ -212,6 +228,7 @@ pub fn r#move(
     } else {
         base_oids
     };
+    // For each base OID, resolve the correct base commit using merge base logic.
     let base_oids = {
         let mut result = Vec::new();
         for base_oid in dag.commit_set_to_vec(&base_oids)? {
@@ -222,8 +239,10 @@ pub fn r#move(
         }
         union_all(&result)
     };
+    // Union sources and bases for the set of commits to move.
     let source_oids = source_oids.union(&base_oids);
 
+    // Print hints to the user if they provided redundant arguments that default to HEAD.
     if let Some(head_oid) = head_oid {
         if get_hint_enabled(&repo, Hint::MoveImplicitHeadArgument)? {
             let should_warn_base = !sources_provided
@@ -252,8 +271,10 @@ pub fn r#move(
             }
         }
     }
+    // base_oids is no longer needed.
     drop(base_oids);
 
+    // Unpack move options and prepare for rebase planning.
     let MoveOptions {
         force_rewrite_public_commits,
         force_in_memory,
@@ -264,10 +285,13 @@ pub fn r#move(
         dump_rebase_plan,
         reparent,
     } = *move_options;
+    // Get current time for event logging.
     let now = SystemTime::now();
     let event_tx_id = event_log_db.make_transaction_id(now, "move")?;
+    // Create thread pool and repo pool for parallel operations.
     let pool = ThreadPoolBuilder::new().build()?;
     let repo_pool = RepoResource::new_pool(&repo)?;
+    // Build the rebase plan for moving commits.
     let rebase_plan = {
         let build_options = BuildRebasePlanOptions {
             force_rewrite_public_commits,
@@ -275,6 +299,7 @@ pub fn r#move(
             dump_rebase_plan,
             detect_duplicate_commits_via_patch_id,
         };
+        // Verify permissions for rewriting the set of commits to move.
         let permissions = {
             let commits_to_move = &source_oids;
             let commits_to_move = commits_to_move.union(&union_all(
@@ -295,21 +320,30 @@ pub fn r#move(
                 }
             }
         };
+        // Initialize the rebase plan builder.
         let mut builder = RebasePlanBuilder::new(&dag, permissions);
 
+        // For each root of the source commits, add move or fixup operations to the plan.
         let source_roots = dag.query_roots(source_oids.clone())?;
         for source_root in dag.commit_set_to_vec(&source_roots)? {
             if fixup {
+                // If fixup mode, fix up all descendants of the source root onto the destination.
                 let commits = dag.query_descendants(CommitSet::from(source_root))?;
                 let commits = dag.commit_set_to_vec(&commits)?;
                 for commit in commits.iter() {
                     builder.fixup_commit(*commit, dest_oid)?;
                 }
             } else {
+                // Otherwise, move the subtree rooted at source_root to the destination.
                 builder.move_subtree(source_root, vec![dest_oid])?;
+            }
+
+            if reparent {
+                builder.reparent_subtree(source_root, vec![dest_oid], repo)?;
             }
         }
 
+        // Handle exact components: sort roots topologically and process each.
         let component_roots: CommitSet = exact_components.keys().cloned().collect();
         let component_roots: Vec<NonZeroOid> = sorted_commit_set(&repo, &dag, &component_roots)?
             .iter()
@@ -318,7 +352,8 @@ pub fn r#move(
         for component_root in component_roots.iter().cloned() {
             let component = exact_components.get(&component_root).unwrap();
 
-            // Find the non-inclusive ancestor components of the current root
+            // Find the non-inclusive ancestor components of the current root.
+            // This determines where the current component should be moved.
             let mut possible_destinations: Vec<NonZeroOid> = vec![];
             for root in component_roots.iter().cloned() {
                 let component = exact_components.get(&root).unwrap();
@@ -329,6 +364,8 @@ pub fn r#move(
                 }
             }
 
+            // Determine the destination OID for the current component.
+            // If there are multiple possible destinations, ensure a single lineage.
             let component_dest_oid = if possible_destinations.is_empty() {
                 dest_oid
             } else {
@@ -371,7 +408,7 @@ pub fn r#move(
                     .get(&possible_destinations[possible_destinations.len() - 1])
                     .unwrap();
                 // The current component could be descended from any commit
-                // in nearest_component, not just it's head.
+                // in nearest_component, not just its head.
                 let dest_ancestor = dag
                     .query_ancestors(CommitSet::from(component_root))?
                     .intersection(nearest_component);
@@ -381,11 +418,12 @@ pub fn r#move(
                 }
             };
 
-            // Again, we've already confirmed that each component has but 1 parent
+            // Each component has exactly one parent (already checked).
             let component_parent = NonZeroOid::try_from(
                 dag.set_first(&dag.query_parents(CommitSet::from(component_root))?)?
                     .unwrap(),
             )?;
+            // Find children of the component that are not part of the component itself.
             let component_children: CommitSet =
                 dag.query_children(component.clone())?.difference(component);
             let component_children = dag.filter_visible_commits(component_children)?;
@@ -396,7 +434,7 @@ pub fn r#move(
                 // of the range. If, however, we're inserting the range and the
                 // destination commit is in one of those subtrees, then we
                 // should only move the commits from the root of that child
-                // subtree up to (and including) the destination commmit.
+                // subtree up to (and including) the destination commit.
                 if insert && dag.query_is_ancestor(component_child, component_dest_oid)? {
                     builder.move_range(component_child, component_dest_oid, component_parent)?;
                 } else {
@@ -404,6 +442,7 @@ pub fn r#move(
                 }
             }
 
+            // Add fixup or move operations for the component root itself.
             if fixup {
                 let commits = dag.commit_set_to_vec(component)?;
                 for commit in commits.iter() {
@@ -412,8 +451,13 @@ pub fn r#move(
             } else {
                 builder.move_subtree(component_root, vec![component_dest_oid])?;
             }
+
+            if reparent {
+                builder.reparent_subtree(component_root, vec![component_dest_oid], repo)?;
+            }
         }
 
+        // If insert mode is enabled, move children of the destination to the new source head.
         if insert {
             let source_head = {
                 let exact_head = if component_roots.is_empty() {
@@ -470,10 +514,29 @@ pub fn r#move(
 
             for dest_child in dag.commit_set_to_vec(&dest_children)? {
                 builder.move_subtree(dest_child, vec![source_head])?;
+                if reparent {
+                    builder.reparent_subtree(dest_child, vec![source_head], &repo)?;
+                }
             }
         }
+        // If reparent mode is enabled, reparent moved commits to their original parents.
+        // This is similar to amend.rs logic.
+        if reparent {
+            let mut moved_commits = source_oids.clone();
+            for component in exact_components.values() {
+                moved_commits = moved_commits.union(component);
+            }
+            let moved_commits_vec = dag.commit_set_to_vec(&moved_commits)?;
+            for commit_oid in moved_commits_vec {
+                let parents_set = dag.query_parents(CommitSet::from(commit_oid))?;
+                let parent_oids = dag.commit_set_to_vec(&parents_set)?;
+                builder.reparent_subtree(commit_oid, parent_oids, &repo)?;
+            }
+        }
+        // Build the final rebase plan.
         builder.build(effects, &pool, &repo_pool)?
     };
+    // Execute the rebase plan, or report if nothing needs to be done.
     let result = match rebase_plan {
         Ok(None) => {
             writeln!(effects.get_output_stream(), "Nothing to do.")?;
@@ -505,23 +568,29 @@ pub fn r#move(
         }
     };
 
+    // Handle the result of executing the rebase plan.
     match result {
+        // Success: commits were moved.
         ExecuteRebasePlanResult::Succeeded { rewritten_oids: _ } => Ok(Ok(())),
 
+        // Dry-run: report that no commits were moved.
         ExecuteRebasePlanResult::WouldSucceed if dry_run => {
             writeln!(effects.get_output_stream(), "(This was a dry-run; no commits were moved. Re-run without --dry-run to actually move commits.)")?;
             Ok(Ok(()))
         }
 
+        // Should not happen unless dry-run.
         ExecuteRebasePlanResult::WouldSucceed => {
             unreachable!("WouldSucceed should only apply to dry runs")
         }
 
+        // Merge conflicts occurred: describe and report error.
         ExecuteRebasePlanResult::DeclinedToMerge { failed_merge_info } => {
             failed_merge_info.describe(effects, &repo, MergeConflictRemediation::Retry)?;
             Ok(Err(ExitCode(1)))
         }
 
+        // Other failure: propagate exit code.
         ExecuteRebasePlanResult::Failed { exit_code } => Ok(Err(exit_code)),
     }
 }
