@@ -13,6 +13,7 @@ pub mod dialoguer_edit;
 
 use lib::core::check_out::CheckOutCommitOptions;
 use lib::core::repo_ext::RepoExt;
+use lib::try_exit_code;
 use lib::util::{ExitCode, EyreExitOr};
 use rayon::ThreadPoolBuilder;
 use std::collections::{HashMap, HashSet};
@@ -136,41 +137,14 @@ pub fn reword(
     let messages = match messages {
         InitialCommitMessages::Discard | InitialCommitMessages::Messages(_) => messages,
         InitialCommitMessages::FixUp(revset) => {
-            let commits_to_fixup = resolve_commits_from_hashes(
+            let message = try_exit_code!(message_for_fixup_commits(
                 &repo,
                 &mut dag,
                 effects,
-                vec![revset.clone()],
+                &revset,
                 resolve_revset_options,
-            )?
-            .unwrap_or_default();
-            let commit_to_fixup = match commits_to_fixup.as_slice() {
-                [commit_to_fixup] => {
-                    let commits: CommitSet = commits.iter().map(|c| c.get_oid()).collect();
-                    if !dag.set_contains(
-                        &dag.query_common_ancestors(commits)?,
-                        commit_to_fixup.get_oid(),
-                    )? {
-                        writeln!(
-                            effects.get_error_stream(),
-                            "The commit supplied to --fixup must be an ancestor of all commits being reworded.\nAborting.",
-                        )?;
-                        return Ok(Err(ExitCode(1)));
-                    }
-                    commit_to_fixup
-                }
-                commits => {
-                    writeln!(
-                        effects.get_error_stream(),
-                        "--fixup expects exactly 1 commit, but '{}' evaluated to {}.\nAborting.",
-                        revset,
-                        commits.len()
-                    )?;
-                    return Ok(Err(ExitCode(1)));
-                }
-            };
-            let message = commit_to_fixup.get_summary()?.to_vec();
-            let message = format!("fixup! {}", message.into_string_lossy());
+                &commits
+            )?);
             InitialCommitMessages::Messages(vec![message])
         }
     };
@@ -329,6 +303,52 @@ pub fn reword(
         }
         ExecuteRebasePlanResult::Failed { exit_code } => Ok(Err(exit_code)),
     }
+}
+
+/// Generate a commit message with the fixup! prefix.
+pub fn message_for_fixup_commits<'repo>(
+    repo: &'repo Repo,
+    dag: &mut Dag,
+    effects: &Effects,
+    revset_to_fixup: &Revset, // revset as the fixup! target
+    resolve_revset_options: &ResolveRevsetOptions,
+    edited_commits: &[Commit<'_>], // whose messages are being edited
+) -> EyreExitOr<String> {
+    let commits_to_fixup = resolve_commits_from_hashes(
+        &repo,
+        dag,
+        effects,
+        vec![revset_to_fixup.clone()],
+        resolve_revset_options,
+    )?
+    .unwrap_or_default();
+    let commit_to_fixup = match commits_to_fixup.as_slice() {
+        [commit_to_fixup] => {
+            let commits: CommitSet = edited_commits.iter().map(|c| c.get_oid()).collect();
+            if !dag.set_contains(
+                &dag.query_common_ancestors(commits)?,
+                commit_to_fixup.get_oid(),
+            )? {
+                writeln!(
+                    effects.get_error_stream(),
+                    "The commit supplied to --fixup must be an ancestor of all commits whose messages are being edited.\nAborting.",
+                )?;
+                return Ok(Err(ExitCode(1)));
+            }
+            commit_to_fixup
+        }
+        commits => {
+            writeln!(
+                effects.get_error_stream(),
+                "--fixup expects exactly 1 commit, but '{}' evaluated to {}.\nAborting.",
+                revset_to_fixup,
+                commits.len()
+            )?;
+            return Ok(Err(ExitCode(1)));
+        }
+    };
+    let message = commit_to_fixup.get_summary()?.to_vec();
+    Ok(Ok(format!("fixup! {}", message.into_string_lossy())))
 }
 
 /// Turn a list of ref-ish strings into a list of Commits.
